@@ -1,0 +1,44 @@
+<!DOCTYPE HTML>
+<!-- SlowDash LLM Agent — webcam-OCR monitoring page
+     Part of the slowdash-agent-tools submodule.
+     Author: Yao Yin
+
+     URL parameters:
+       config=slowagent-NAME.json   — load a saved agent layout (required)
+-->
+<html lang="en">
+<head>
+  <meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SlowAgent</title>
+
+  <link rel="icon" href="favicon.png">
+
+  <!-- Base SlowDash styles (header / buttons / selects) -->
+  <link rel="stylesheet" type="text/css" href="slowjs/slowdash.css">
+  <!-- Theme stylesheet — href is set by slowagent-app.mjs after reading the
+       project config, mirroring slowdash.html.  Must start empty so we can
+       await its `load` event before building the header. -->
+  <link rel="stylesheet" type="text/css" id="sd-theme-css">
+  <!-- Page-specific layout -->
+  <link rel="stylesheet" type="text/css" href="slowagent/slowagent.css">
+</head>
+
+<body>
+  <div id="sa-root">
+    <!-- Header bar — populated by Frame (same as slowplot.html / slowcanvas.html) -->
+    <div id="sa-header"></div>
+
+    <!-- Body: [latest image + prompt | live plots] -->
+    <div id="sa-body">Loading…</div>
+  </div>
+
+  <script type="module">
+    import { SlowAgentApp } from './slowagent/slowagent-app.mjs';
+    window.addEventListener('DOMContentLoaded', async () => {
+        const app = new SlowAgentApp();
+        await app.run();
+    });
+  </script>
+</body>
+</html>

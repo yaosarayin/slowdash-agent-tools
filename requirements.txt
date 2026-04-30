@@ -1,0 +1,5 @@
+# Python dependencies for slowdash-agent-tools.
+# Install with:  pip install -r slowdash-agent-tools/requirements.txt
+
+anthropic>=0.40.0
+tomli>=2.0.0; python_version < "3.11"
