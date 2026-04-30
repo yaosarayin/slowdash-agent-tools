@@ -41,6 +41,24 @@ export class AgentAPI {
 
     // ── Data / Blob ──────────────────────────────────────────────────────── //
 
+    // ── Slowtask control ──────────────────────────────────────────────── //
+
+    /** POST a slowdash control command (calls a function on the slowtask
+     *  by name, e.g. {"force_refresh": true}).  Returns true on success. */
+    static async sendCommand(action, params = {}) {
+        const resp = await fetch('./api/control', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json; charset=utf-8' },
+            body:    JSON.stringify({ [action]: true, ...params }),
+        });
+        if (!resp.ok) {
+            const text = await resp.text().catch(() => '');
+            throw new Error(`Command "${action}" failed: HTTP ${resp.status} — ${text}`);
+        }
+        return resp.json().catch(() => true);
+    }
+
+
     // ── Cycling-frames source ─────────────────────────────────────────── //
 
     /** List image files currently available in the layout's source/display

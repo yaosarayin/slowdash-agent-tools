@@ -148,7 +148,7 @@ export class SlowAgentApp {
         const imgInner = document.createElement('div');
         imgInner.className = 'sa-image-inner';
         const img = document.createElement('img');
-        img.className = 'sa-image';
+        img.className = 'sa-image sa-hidden';   // shown after the first frame loads
         img.alt = 'Recent webcam frames';
         imgInner.appendChild(img);
         const placeholder = document.createElement('div');
@@ -187,13 +187,28 @@ export class SlowAgentApp {
         saveBtn.textContent = 'Save Prompt';
         saveBtn.title = 'Write this prompt back to ' + this.configFile + '.  '
                       + 'The slowtask will reload within a couple of seconds.';
+        const refreshBtn = document.createElement('button');
+        refreshBtn.className = 'sa-btn';
+        refreshBtn.textContent = 'Force Refresh';
+        refreshBtn.title = 'Run the LLM right now on the frames currently in last_images';
         const status = document.createElement('span');
         status.className = 'sa-prompt-status';
         promptRow.appendChild(saveBtn);
+        promptRow.appendChild(refreshBtn);
         promptRow.appendChild(status);
         promptWrap.appendChild(promptRow);
-        this._statusEl = status;
-        this._saveBtn  = saveBtn;
+
+        const refreshHint = document.createElement('div');
+        refreshHint.className = 'sa-hint';
+        refreshHint.textContent =
+            'Force Refresh: re-runs the LLM on the images currently in '
+          + 'last_images, bypassing the dedup cache. Useful for testing '
+          + 'a new prompt without waiting for the next 30-second cycle.';
+        promptWrap.appendChild(refreshHint);
+
+        this._statusEl   = status;
+        this._saveBtn    = saveBtn;
+        this._refreshBtn = refreshBtn;
         left.appendChild(promptWrap);
 
         // Example prompt (read-only)
@@ -282,6 +297,19 @@ export class SlowAgentApp {
             }
         });
 
+        this._refreshBtn.addEventListener('click', async () => {
+            this._setStatus('Forcing LLM refresh…');
+            this._refreshBtn.disabled = true;
+            try {
+                await AgentAPI.sendCommand('force_refresh');
+                this._setStatus('Refresh queued — values will appear in the plot shortly.');
+            } catch (e) {
+                this._setStatus(`Error: ${e.message}`, true);
+            } finally {
+                this._refreshBtn.disabled = false;
+            }
+        });
+
         // Cmd/Ctrl-S in the prompt area saves too.
         this._promptEl.addEventListener('keydown', (e) => {
             if ((e.metaKey || e.ctrlKey) && e.key === 's') {
@@ -322,16 +350,16 @@ export class SlowAgentApp {
         const tick = () => {
             const frames = this._cycleFrames;
             if (!frames || frames.length === 0) {
-                this._imgEl.style.display = 'none';
-                this._imgPlaceholder.style.display = '';
+                this._imgEl.classList.add('sa-hidden');
+                this._imgPlaceholder.classList.remove('sa-hidden');
                 if (this._captionEl) this._captionEl.textContent = '';
                 return;
             }
             const i = this._cycleIdx % frames.length;
             const frame = frames[i];
             this._imgEl.src = AgentAPI.sourceFrameURL(this.configFile, frame.name);
-            this._imgEl.style.display = '';
-            this._imgPlaceholder.style.display = 'none';
+            this._imgEl.classList.remove('sa-hidden');
+            this._imgPlaceholder.classList.add('sa-hidden');
             if (this._captionEl) {
                 this._captionEl.textContent =
                     `${frame.name}  ·  frame ${i + 1}/${frames.length}`;

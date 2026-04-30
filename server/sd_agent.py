@@ -181,11 +181,13 @@ def _resolve_display_dir(layout_file: str):
     """Read the layout JSON and return the absolute path of the directory
     that holds the cycling-display images.  Mirrors the slowtask's logic:
 
-      - if `capture.rolling_dir` is set, that directory is the display dir
-        (HTTP webcams write each capture there);
-      - otherwise, if `capture.source` is a file:// URL or a relative path,
-        treat it as a directory of frames;
-      - otherwise (an http(s):// camera with no rolling_dir), return None.
+      - HTTP source: the slowtask writes captured frames into
+        `capture.batch_dir` (default `last_images`); that's the display dir.
+      - file:// or path source: the source IS the directory.
+
+    `capture.rolling_dir` is accepted as a backward-compat alias for
+    `batch_dir`.  Returns an absolute path, or None if no on-disk view
+    exists.
     """
     path = os.path.join(PROJECT_DIR, 'config', layout_file)
     try:
@@ -195,18 +197,16 @@ def _resolve_display_dir(layout_file: str):
         return None
 
     cap = doc.get('capture') or {}
-
-    rolling = cap.get('rolling_dir')
-    if rolling:
-        if not os.path.isabs(rolling):
-            rolling = os.path.normpath(os.path.join(PROJECT_DIR, rolling))
-        return rolling
-
     src = cap.get('source') or ''
-    if src.startswith('http://') or src.startswith('https://'):
-        return None      # no on-disk view for HTTP without rolling_dir
 
-    # Strip file: scheme prefixes if present.
+    if src.startswith('http://') or src.startswith('https://'):
+        # HTTP source uses batch_dir (or rolling_dir) for the on-disk view.
+        d = cap.get('batch_dir') or cap.get('rolling_dir') or 'last_images'
+        if not os.path.isabs(d):
+            d = os.path.normpath(os.path.join(PROJECT_DIR, d))
+        return d
+
+    # file:// or relative-path source: the source IS the display dir.
     if src.startswith('file:///'):
         return src[len('file://'):]
     if src.startswith('file://'):
