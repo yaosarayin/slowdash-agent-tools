@@ -240,6 +240,98 @@ html, body {
 }
 .sa-btn-primary:hover { background: #2980b9; }
 
+/* Highlight the Save button when the textarea differs from the saved
+ * value, so it's visually obvious that there are unsaved edits. */
+.sa-btn-modified {
+    background:    #d35400 !important;
+    border-color:  #d35400 !important;
+    color:         white !important;
+    box-shadow:    0 0 0 2px rgba(211, 84, 0, 0.25);
+}
+.sa-btn-modified:hover { background: #c0392b !important; }
+
+
+/* ── Capture cadence ──────────────────────────────────────────────────── */
+
+.sa-capture-row {
+    display:        flex;
+    align-items:    center;
+    flex-wrap:      wrap;
+    gap:            8px;
+    padding:        8px 12px;
+    background:     var(--sd-pad-bg, #fafafa);
+}
+.sa-capture-lbl {
+    font-size:      0.85rem;
+    color:          var(--sd-color-text, #333);
+}
+.sa-capture-input {
+    width:          7em;
+    padding:        4px 8px;
+    border:         1px solid var(--sd-popup-border, #bbb);
+    border-radius:  4px;
+    background:     var(--sd-color-bg, white);
+    color:          var(--sd-color-text, #222);
+    font-family:    inherit;
+    font-size:      0.9rem;
+}
+.sa-capture-input:focus {
+    outline:        none;
+    border-color:   var(--sd-header-bg, #3498db);
+    box-shadow:     0 0 0 2px rgba(52, 152, 219, 0.25);
+}
+.sa-capture-unit {
+    font-size:      0.85rem;
+    color:          var(--sd-color-text, #555);
+    opacity:        0.8;
+}
+
+
+/* ── Connected-channels checklist ─────────────────────────────────────── */
+
+.sa-channels {
+    display:        flex;
+    flex-direction: column;
+    padding:        6px 12px 4px;
+    background:     var(--sd-color-bg, white);
+}
+.sa-channel-row {
+    display:        flex;
+    align-items:    center;
+    gap:            10px;
+    padding:        4px 4px;
+    border-radius:  4px;
+    cursor:         pointer;
+    user-select:    none;
+}
+.sa-channel-row:hover {
+    background:     var(--sd-pad-bg, #f3f3f3);
+}
+.sa-channel-cb {
+    margin:         0;
+    cursor:         pointer;
+}
+.sa-channel-dot {
+    display:        inline-block;
+    width:          10px;
+    height:         10px;
+    border-radius:  50%;
+    flex-shrink:    0;
+    border:         1px solid rgba(0,0,0,0.2);
+}
+.sa-channel-label {
+    font-size:      0.84rem;
+    color:          var(--sd-color-text, #333);
+    overflow:       hidden;
+    text-overflow:  ellipsis;
+    white-space:    nowrap;
+}
+.sa-channels-status-row {
+    padding:        2px 14px 8px;
+    background:     var(--sd-color-bg, white);
+    min-height:     1.2em;
+}
+
 
 /* ── Plot iframe ──────────────────────────────────────────────────────── */
 

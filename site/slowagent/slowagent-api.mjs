@@ -26,14 +26,21 @@ export class AgentAPI {
 
     /** Patch the `llm.prompt` field of a layout file. */
     static async updatePrompt(filename, prompt) {
-        const resp = await fetch(`./api/agent/prompt/${filename}`, {
+        return AgentAPI.updateSettings(filename, { prompt });
+    }
+
+    /** Patch any subset of {prompt, cycle_seconds, connected} on a layout
+     *  file.  `connected` is a dict {channel_name: bool}.  Returns the
+     *  parsed response on success, throws otherwise. */
+    static async updateSettings(filename, patch) {
+        const resp = await fetch(`./api/agent/settings/${filename}`, {
             method:  'POST',
             headers: { 'Content-Type': 'application/json; charset=utf-8' },
-            body:    JSON.stringify({ prompt }),
+            body:    JSON.stringify(patch),
         });
         if (!resp.ok) {
             const text = await resp.text().catch(() => '');
-            throw new Error(`Save prompt failed: HTTP ${resp.status} — ${text}`);
+            throw new Error(`Save settings failed: HTTP ${resp.status} — ${text}`);
         }
         return resp.json();
     }

@@ -1,5 +1,9 @@
 # Python dependencies for slowdash-agent-tools.
 # Install with:  pip install -r slowdash-agent-tools/requirements.txt
+#
+# Vision/OCR is delegated to the headless `claude` CLI, so the Anthropic
+# SDK is no longer a dependency.  Install Claude Code separately:
+#   https://claude.com/claude-code
 
-anthropic>=0.40.0
+Pillow>=9.0.0
 tomli>=2.0.0; python_version < "3.11"

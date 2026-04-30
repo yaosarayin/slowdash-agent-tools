@@ -5,9 +5,14 @@
 //   ┌────────────── header (Frame, themed by project) ──────────────┐
 //   │                                                                │
 //   │  ┌──────────────────┐   ┌────────────────────────────────────┐│
-//   │  │ latest webcam    │   │                                    ││
-//   │  │ image            │   │   live plots                       ││
-//   │  ├──────────────────┤   │   (slowplot iframe)                ││
+//   │  │ recent frames    │   │  slowplot controls (selects+status)││
+//   │  │ (cycler)         │   ├────────────────────────────────────┤│
+//   │  ├──────────────────┤   │   live plots                       ││
+//   │  │ capture cadence  │   │   (slowplot iframe)                ││
+//   │  ├──────────────────┤   │                                    ││
+//   │  │ connected        │   │                                    ││
+//   │  │ channels         │   │                                    ││
+//   │  ├──────────────────┤   │                                    ││
 //   │  │ prompt textarea  │   │                                    ││
 //   │  │ + save button    │   │                                    ││
 //   │  ├──────────────────┤   │                                    ││
@@ -15,17 +20,18 @@
 //   │  │ (read-only)      │   │                                    ││
 //   │  └──────────────────┘   └────────────────────────────────────┘│
 //   └────────────────────────────────────────────────────────────────┘
-//
-// The slowtask is what actually drives the loop: this page just visualizes
-// what the slowtask produces and lets the user edit the LLM prompt.
 
 import { JG as $ } from '../slowjs/jagaimo/jagaimo.mjs';
 import { Frame }  from '../slowjs/frame.mjs';
 import { AgentAPI } from './slowagent-api.mjs';
 
 
-const FRAME_LIST_REFRESH_MS = 5000;   // how often to re-list available frames
-const FRAME_CYCLE_MS        = 1500;   // how long each frame is shown in the cycler
+// Cycler tuning.  The list-poll interval is the main robustness lever:
+// the slowtask wipes batch_dir at the start of every cycle, so any cached
+// list older than a couple of seconds risks pointing at files that no
+// longer exist (→ 404 on <img>).  Polling at 2 s keeps the gap small.
+const FRAME_LIST_REFRESH_MS = 2000;
+const FRAME_CYCLE_MS        = 1500;
 
 
 export class SlowAgentApp {
@@ -46,8 +52,19 @@ export class SlowAgentApp {
         this._cycleFrames    = [];   // [{name, mtime}, ...]
         this._cycleIdx       = 0;
         this._cycleTimer     = null;
-        this._frameListTimer = null;
+        this._lastListMs     = 0;
+        this._listInFlight   = null;
         this._captionEl      = null;
+
+        // Settings controls
+        this._cycleInput      = null;
+        this._cycleStatus     = null;
+        this._channelChecks   = {};   // {channelName: <input type=checkbox>}
+        this._channelStatus   = null;
+        this._channelTimer    = null;
+
+        // Prompt save state
+        this._initialPrompt   = '';
     }
 
 
@@ -63,7 +80,6 @@ export class SlowAgentApp {
             return;
         }
 
-        // Theme — same dance as slowcanvas: set the href, await `load`.
         const theme = this.projectConfig?.style?.theme || 'light';
         try { await this._loadTheme(theme); }
         catch (e) { console.warn('theme css failed to load', e); }
@@ -132,102 +148,15 @@ export class SlowAgentApp {
         body.innerHTML = '';
         body.className = 'sa-body';
 
-        // Left column ─────────────────────────────────────────────────────
+        // Left column
         const left = document.createElement('div');
         left.className = 'sa-col sa-col-left';
 
-        // Recent-frames cycler — runs entirely in JS.  Polls the source
-        // dir every few seconds and rotates through whatever's there.
-        const imgWrap = document.createElement('div');
-        imgWrap.className = 'sa-section sa-image-wrap';
-        const imgHdr = document.createElement('div');
-        imgHdr.className = 'sa-section-hdr';
-        imgHdr.textContent = 'Recent Frames';
-        imgWrap.appendChild(imgHdr);
-
-        const imgInner = document.createElement('div');
-        imgInner.className = 'sa-image-inner';
-        const img = document.createElement('img');
-        img.className = 'sa-image sa-hidden';   // shown after the first frame loads
-        img.alt = 'Recent webcam frames';
-        imgInner.appendChild(img);
-        const placeholder = document.createElement('div');
-        placeholder.className = 'sa-image-placeholder';
-        placeholder.textContent = 'Waiting for the slowtask to capture frames…';
-        imgInner.appendChild(placeholder);
-        const caption = document.createElement('div');
-        caption.className = 'sa-image-caption';
-        imgInner.appendChild(caption);
-        imgWrap.appendChild(imgInner);
-        left.appendChild(imgWrap);
-        this._imgEl         = img;
-        this._imgPlaceholder = placeholder;
-        this._captionEl     = caption;
-
-        // Prompt textbox
-        const promptWrap = document.createElement('div');
-        promptWrap.className = 'sa-section';
-        const promptHdr = document.createElement('div');
-        promptHdr.className = 'sa-section-hdr';
-        promptHdr.textContent = 'Extraction Prompt';
-        promptWrap.appendChild(promptHdr);
-
-        const promptArea = document.createElement('textarea');
-        promptArea.className = 'sa-textarea sa-prompt';
-        promptArea.spellcheck = false;
-        promptArea.value = this.config?.llm?.prompt || '';
-        promptArea.placeholder = 'Describe what the LLM should extract from each frame…';
-        promptWrap.appendChild(promptArea);
-        this._promptEl = promptArea;
-
-        const promptRow = document.createElement('div');
-        promptRow.className = 'sa-prompt-row';
-        const saveBtn = document.createElement('button');
-        saveBtn.className = 'sa-btn sa-btn-primary';
-        saveBtn.textContent = 'Save Prompt';
-        saveBtn.title = 'Write this prompt back to ' + this.configFile + '.  '
-                      + 'The slowtask will reload within a couple of seconds.';
-        const refreshBtn = document.createElement('button');
-        refreshBtn.className = 'sa-btn';
-        refreshBtn.textContent = 'Force Refresh';
-        refreshBtn.title = 'Run the LLM right now on the frames currently in last_images';
-        const status = document.createElement('span');
-        status.className = 'sa-prompt-status';
-        promptRow.appendChild(saveBtn);
-        promptRow.appendChild(refreshBtn);
-        promptRow.appendChild(status);
-        promptWrap.appendChild(promptRow);
-
-        const refreshHint = document.createElement('div');
-        refreshHint.className = 'sa-hint';
-        refreshHint.textContent =
-            'Force Refresh: re-runs the LLM on the images currently in '
-          + 'last_images, bypassing the dedup cache. Useful for testing '
-          + 'a new prompt without waiting for the next 30-second cycle.';
-        promptWrap.appendChild(refreshHint);
-
-        this._statusEl   = status;
-        this._saveBtn    = saveBtn;
-        this._refreshBtn = refreshBtn;
-        left.appendChild(promptWrap);
-
-        // Example prompt (read-only)
-        const example = (this.config?.llm?.example_prompt || '').trim();
-        if (example) {
-            const exWrap = document.createElement('div');
-            exWrap.className = 'sa-section';
-            const exHdr = document.createElement('div');
-            exHdr.className = 'sa-section-hdr';
-            exHdr.textContent = 'Example Prompt (read-only)';
-            exWrap.appendChild(exHdr);
-            const exBody = document.createElement('textarea');
-            exBody.className = 'sa-textarea sa-example';
-            exBody.readOnly = true;
-            exBody.value = example;
-            exWrap.appendChild(exBody);
-            this._exampleEl = exBody;
-            left.appendChild(exWrap);
-        }
+        this._buildImageSection(left);
+        this._buildCaptureSection(left);
+        this._buildChannelsSection(left);
+        this._buildPromptSection(left);
+        this._buildExampleSection(left);
 
         body.appendChild(left);
 
@@ -237,7 +166,7 @@ export class SlowAgentApp {
         body.appendChild(splitter);
         this._wireSplitter(splitter, left);
 
-        // Right column — slowplot iframe ─────────────────────────────────
+        // Right column — slowplot iframe
         const right = document.createElement('div');
         right.className = 'sa-col sa-col-right';
 
@@ -250,18 +179,26 @@ export class SlowAgentApp {
         iframe.className = 'sa-plot-iframe';
         iframe.title = 'Live plots';
         iframe.src = this._plotURL();
-        // Hide the embedded slowplot header so we don't get a doubled-up
-        // SlowDash header inside the right pane.  Same trick as
-        // slowdash-canvas's live preview iframe.
+
+        // Trim the embedded slowplot's header to JUST the row of plot-control
+        // selects (Time Range, Auto-Reload, Grid) and the "Update: …" status.
+        // We hide the redundant title, clock, logo, and the duplicate
+        // Home/Help/Save/Snapshot buttons — those are already in the
+        // slowagent header above.
         iframe.addEventListener('load', () => {
             try {
                 const doc = iframe.contentDocument;
                 if (!doc) return;
-                if (!doc.getElementById('sa-hide-header-style')) {
+                if (!doc.getElementById('sa-trim-header-style')) {
                     const style = doc.createElement('style');
-                    style.id = 'sa-hide-header-style';
+                    style.id = 'sa-trim-header-style';
                     style.textContent =
-                        '#sd-header{display:none!important}' +
+                        '.sd-header-title{display:none!important}' +
+                        '.sd-header-logo{display:none!important}' +
+                        '.sd-header-clock{display:none!important}' +
+                        '.sd-header-buttons{display:none!important}' +
+                        '.sd-header-progress{display:none!important}' +
+                        '#sd-header{padding:2px 6px!important;min-height:0!important}' +
                         'body{margin:0!important}' +
                         '#sd-layout{margin:0!important;padding:0!important}';
                     doc.head.appendChild(style);
@@ -274,28 +211,242 @@ export class SlowAgentApp {
         body.appendChild(right);
     }
 
+    _buildImageSection(left) {
+        const wrap = document.createElement('div');
+        wrap.className = 'sa-section sa-image-wrap';
+        const hdr = document.createElement('div');
+        hdr.className = 'sa-section-hdr';
+        hdr.textContent = 'Recent Frames';
+        wrap.appendChild(hdr);
+
+        const inner = document.createElement('div');
+        inner.className = 'sa-image-inner';
+        const img = document.createElement('img');
+        img.className = 'sa-image sa-hidden';
+        img.alt = 'Recent webcam frames';
+        inner.appendChild(img);
+        const placeholder = document.createElement('div');
+        placeholder.className = 'sa-image-placeholder';
+        placeholder.textContent = 'Waiting for the slowtask to capture frames…';
+        inner.appendChild(placeholder);
+        const caption = document.createElement('div');
+        caption.className = 'sa-image-caption';
+        inner.appendChild(caption);
+        wrap.appendChild(inner);
+        left.appendChild(wrap);
+
+        this._imgEl          = img;
+        this._imgPlaceholder = placeholder;
+        this._captionEl      = caption;
+    }
+
+    _buildCaptureSection(left) {
+        const wrap = document.createElement('div');
+        wrap.className = 'sa-section';
+        const hdr = document.createElement('div');
+        hdr.className = 'sa-section-hdr';
+        hdr.textContent = 'Capture Cadence';
+        wrap.appendChild(hdr);
+
+        const row = document.createElement('div');
+        row.className = 'sa-capture-row';
+
+        const lbl = document.createElement('span');
+        lbl.className = 'sa-capture-lbl';
+        lbl.textContent = 'Refresh every';
+
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = '5';
+        input.max = '86400';
+        input.step = '1';
+        input.className = 'sa-capture-input';
+        input.value = String(this.config?.capture?.cycle_seconds ?? 30);
+
+        const unit = document.createElement('span');
+        unit.className = 'sa-capture-unit';
+        unit.textContent = 'seconds';
+
+        const btn = document.createElement('button');
+        btn.className = 'sa-btn';
+        btn.textContent = 'Apply';
+        btn.title = 'Save the new refresh rate to ' + this.configFile + '. '
+                  + 'The slowtask picks it up within a few seconds.';
+
+        const status = document.createElement('span');
+        status.className = 'sa-prompt-status sa-capture-status';
+
+        row.appendChild(lbl);
+        row.appendChild(input);
+        row.appendChild(unit);
+        row.appendChild(btn);
+        row.appendChild(status);
+        wrap.appendChild(row);
+
+        const hint = document.createElement('div');
+        hint.className = 'sa-hint';
+        hint.textContent =
+            'How often a new batch of frames is captured and sent to the LLM. '
+          + 'Minimum 5 seconds. The new value is saved to the layout file '
+          + 'and persists across page reloads.';
+        wrap.appendChild(hint);
+
+        this._cycleInput   = input;
+        this._cycleStatus  = status;
+        this._cycleApplyBtn = btn;
+
+        left.appendChild(wrap);
+    }
+
+    _buildChannelsSection(left) {
+        const channels = this.config?.channels || [];
+        if (!channels.length) return;
+
+        const wrap = document.createElement('div');
+        wrap.className = 'sa-section';
+        const hdr = document.createElement('div');
+        hdr.className = 'sa-section-hdr';
+        hdr.textContent = 'Connected Channels';
+        wrap.appendChild(hdr);
+
+        const list = document.createElement('div');
+        list.className = 'sa-channels';
+
+        this._channelChecks = {};
+
+        for (const c of channels) {
+            const row = document.createElement('label');
+            row.className = 'sa-channel-row';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.className = 'sa-channel-cb';
+            cb.checked = (c.connected !== false);  // default true if absent
+            const dot = document.createElement('span');
+            dot.className = 'sa-channel-dot';
+            dot.style.background = c.color || '#888';
+            const lbl = document.createElement('span');
+            lbl.className = 'sa-channel-label';
+            lbl.textContent = c.label || c.name;
+            row.appendChild(cb);
+            row.appendChild(dot);
+            row.appendChild(lbl);
+            list.appendChild(row);
+
+            this._channelChecks[c.name] = cb;
+        }
+
+        wrap.appendChild(list);
+
+        const statusRow = document.createElement('div');
+        statusRow.className = 'sa-channels-status-row';
+        const status = document.createElement('span');
+        status.className = 'sa-prompt-status';
+        statusRow.appendChild(status);
+        wrap.appendChild(statusRow);
+        this._channelStatus = status;
+
+        const hint = document.createElement('div');
+        hint.className = 'sa-hint';
+        hint.textContent =
+            'Uncheck channels that are not physically connected. '
+          + 'The LLM is told explicitly to ignore unchecked channels, '
+          + 'and any value the LLM still returns for an unchecked channel '
+          + 'is dropped before being plotted.';
+        wrap.appendChild(hint);
+
+        left.appendChild(wrap);
+    }
+
+    _buildPromptSection(left) {
+        const wrap = document.createElement('div');
+        wrap.className = 'sa-section';
+        const hdr = document.createElement('div');
+        hdr.className = 'sa-section-hdr';
+        hdr.textContent = 'Extraction Prompt';
+        wrap.appendChild(hdr);
+
+        const area = document.createElement('textarea');
+        area.className = 'sa-textarea sa-prompt';
+        area.spellcheck = false;
+        area.value = this.config?.llm?.prompt || '';
+        area.placeholder = 'Describe what the LLM should extract from each frame…';
+        wrap.appendChild(area);
+        this._promptEl = area;
+        this._initialPrompt = area.value;
+
+        const row = document.createElement('div');
+        row.className = 'sa-prompt-row';
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'sa-btn sa-btn-primary';
+        saveBtn.textContent = 'Save Prompt';
+        saveBtn.title = 'Save this prompt to ' + this.configFile + '.  '
+                      + 'It becomes the default — loaded automatically on '
+                      + 'next page visit and picked up by the slowtask within '
+                      + 'a couple of seconds.';
+        const refreshBtn = document.createElement('button');
+        refreshBtn.className = 'sa-btn';
+        refreshBtn.textContent = 'Force Refresh';
+        refreshBtn.title = 'Run the LLM right now on the frames currently in last_images';
+        const status = document.createElement('span');
+        status.className = 'sa-prompt-status';
+        row.appendChild(saveBtn);
+        row.appendChild(refreshBtn);
+        row.appendChild(status);
+        wrap.appendChild(row);
+
+        const hint = document.createElement('div');
+        hint.className = 'sa-hint';
+        hint.textContent =
+            'Save Prompt: persists the prompt to the layout file (this becomes '
+          + 'the default for next visit). Force Refresh: re-runs the LLM '
+          + 'immediately on the current images, bypassing the dedup cache — '
+          + 'useful for testing a prompt edit without waiting for the next cycle.';
+        wrap.appendChild(hint);
+
+        this._statusEl   = status;
+        this._saveBtn    = saveBtn;
+        this._refreshBtn = refreshBtn;
+
+        left.appendChild(wrap);
+    }
+
+    _buildExampleSection(left) {
+        const example = (this.config?.llm?.example_prompt || '').trim();
+        if (!example) return;
+
+        const wrap = document.createElement('div');
+        wrap.className = 'sa-section';
+        const hdr = document.createElement('div');
+        hdr.className = 'sa-section-hdr';
+        hdr.textContent = 'Example Prompt (read-only)';
+        wrap.appendChild(hdr);
+        const body = document.createElement('textarea');
+        body.className = 'sa-textarea sa-example';
+        body.readOnly = true;
+        body.value = example;
+        wrap.appendChild(body);
+        this._exampleEl = body;
+        left.appendChild(wrap);
+    }
+
     _plotURL() {
-        // Look for a hand-crafted slowplot file with the same name root
-        // (slowagent-Foo.json → slowplot-Foo.json).  This is the only
-        // discovery rule; if a user wants different plotting, they edit
-        // the slowplot file directly.
         const baseName = this.configFile.replace(/^slowagent-/, '').replace(/\.json$/, '');
         const slowplotFile = `slowplot-${baseName}.json`;
         return `slowplot.html?config=${encodeURIComponent(slowplotFile)}`;
     }
 
     _wireEvents() {
-        this._saveBtn.addEventListener('click', async () => {
-            const newPrompt = this._promptEl.value;
-            this._setStatus('Saving…');
-            try {
-                await AgentAPI.updatePrompt(this.configFile, newPrompt);
-                if (this.config?.llm) this.config.llm.prompt = newPrompt;
-                this._setStatus('Saved — slowtask will pick it up shortly.');
-            } catch (e) {
-                this._setStatus(`Error: ${e.message}`, true);
+        // ── Prompt save ───────────────────────────────────────────────── //
+        this._saveBtn.addEventListener('click', () => this._savePrompt());
+
+        const refreshSaveBtnState = () => {
+            if (this._promptEl.value !== this._initialPrompt) {
+                this._saveBtn.classList.add('sa-btn-modified');
+            } else {
+                this._saveBtn.classList.remove('sa-btn-modified');
             }
-        });
+        };
+        this._promptEl.addEventListener('input', refreshSaveBtnState);
 
         this._refreshBtn.addEventListener('click', async () => {
             this._setStatus('Forcing LLM refresh…');
@@ -310,48 +461,155 @@ export class SlowAgentApp {
             }
         });
 
-        // Cmd/Ctrl-S in the prompt area saves too.
         this._promptEl.addEventListener('keydown', (e) => {
             if ((e.metaKey || e.ctrlKey) && e.key === 's') {
                 e.preventDefault();
                 this._saveBtn.click();
             }
         });
+
+        // ── Capture cadence apply ─────────────────────────────────────── //
+        this._cycleApplyBtn.addEventListener('click', () => this._saveCycleSeconds());
+        this._cycleInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                this._saveCycleSeconds();
+            }
+        });
+
+        // ── Connected-channel checkboxes (debounced auto-save) ────────── //
+        for (const cb of Object.values(this._channelChecks)) {
+            cb.addEventListener('change', () => this._saveConnectedDebounced());
+        }
+    }
+
+    async _savePrompt() {
+        const newPrompt = this._promptEl.value;
+        this._setStatus('Saving…');
+        try {
+            await AgentAPI.updatePrompt(this.configFile, newPrompt);
+            if (this.config?.llm) this.config.llm.prompt = newPrompt;
+            this._initialPrompt = newPrompt;
+            this._saveBtn.classList.remove('sa-btn-modified');
+            this._setStatus('Saved. This is now the default prompt — it will load on next visit.');
+        } catch (e) {
+            this._setStatus(`Error: ${e.message}`, true);
+        }
+    }
+
+    async _saveCycleSeconds() {
+        const cs = parseFloat(this._cycleInput.value);
+        if (!isFinite(cs) || cs < 5 || cs > 86400) {
+            this._setCycleStatus('Enter a number between 5 and 86400 seconds.', true);
+            return;
+        }
+        this._setCycleStatus('Saving…');
+        try {
+            await AgentAPI.updateSettings(this.configFile, { cycle_seconds: cs });
+            if (this.config?.capture) this.config.capture.cycle_seconds = cs;
+            this._setCycleStatus(`Saved — slowtask will pick up ${cs}s shortly.`);
+        } catch (e) {
+            this._setCycleStatus(`Error: ${e.message}`, true);
+        }
+    }
+
+    _saveConnectedDebounced() {
+        clearTimeout(this._channelTimer);
+        this._setChannelStatus('Saving…');
+        this._channelTimer = setTimeout(async () => {
+            const flags = {};
+            for (const [name, cb] of Object.entries(this._channelChecks)) {
+                flags[name] = cb.checked;
+            }
+            try {
+                const res = await AgentAPI.updateSettings(
+                    this.configFile, { connected: flags }
+                );
+                for (const c of (this.config?.channels || [])) {
+                    if (c.name in flags) c.connected = flags[c.name];
+                }
+                const n = Object.values(flags).filter(Boolean).length;
+                this._setChannelStatus(
+                    `Saved — ${n} of ${Object.keys(flags).length} channel(s) connected.`
+                );
+                // Server-side slowplot regen ran inside the settings POST
+                // (atomic with the slowagent file write).  If the channel
+                // set actually changed, force the iframe to reload so the
+                // legend reflects the new selection immediately.
+                if (res?.slowplot_changed && this._iframeEl) {
+                    this._iframeEl.src = this._plotURL() + '&_t=' + Date.now();
+                }
+            } catch (e) {
+                this._setChannelStatus(`Error: ${e.message}`, true);
+            }
+        }, 350);
     }
 
     _setStatus(text, isError = false) {
         if (!this._statusEl) return;
-        this._statusEl.textContent  = text;
-        this._statusEl.style.color  = isError ? '#c0392b' : '';
+        this._statusEl.textContent = text;
+        this._statusEl.style.color = isError ? '#c0392b' : '';
+    }
+    _setCycleStatus(text, isError = false) {
+        if (!this._cycleStatus) return;
+        this._cycleStatus.textContent = text;
+        this._cycleStatus.style.color = isError ? '#c0392b' : '';
+    }
+    _setChannelStatus(text, isError = false) {
+        if (!this._channelStatus) return;
+        this._channelStatus.textContent = text;
+        this._channelStatus.style.color = isError ? '#c0392b' : '';
     }
 
 
     // ── Cycling-frames display ─────────────────────────────────────────── //
 
-    _startFrameCycler() {
-        // 1) periodically fetch the list of available frames
-        const refreshList = async () => {
+    _refreshFrameList() {
+        // Coalesce concurrent in-flight requests.
+        if (this._listInFlight) return this._listInFlight;
+        this._listInFlight = (async () => {
             try {
                 const list = await AgentAPI.listSourceFrames(this.configFile);
                 if (Array.isArray(list)) {
-                    // Show in chronological order so the cycle reads as a
-                    // forward-in-time animation; the API returns newest-first.
+                    // Show in chronological order.  API returns newest-first.
                     this._cycleFrames = [...list].sort((a, b) => a.mtime - b.mtime);
                     if (this._cycleIdx >= this._cycleFrames.length) {
                         this._cycleIdx = 0;
                     }
                 }
             } catch (e) { /* keep previous list on error */ }
-        };
-        refreshList();
-        this._frameListTimer = setInterval(refreshList, FRAME_LIST_REFRESH_MS);
+            finally {
+                this._listInFlight = null;
+                this._lastListMs = Date.now();
+            }
+        })();
+        return this._listInFlight;
+    }
 
-        // 2) advance the displayed frame on its own faster cadence
+    _startFrameCycler() {
+        // If an image fails to load (most often: stale entry pointing at a
+        // file the slowtask just wiped) re-list immediately so we drop it
+        // before the next tick paints another broken image.
+        this._imgEl.addEventListener('error', () => {
+            // Hide the broken-image icon while we recover.
+            this._imgEl.classList.add('sa-hidden');
+            this._refreshFrameList();
+        });
+
         const tick = () => {
+            // Re-poll the directory at FRAME_LIST_REFRESH_MS or sooner.
+            // This keeps the list fresh enough that the slowtask's wipe-
+            // and-fill doesn't leave us with stale 404-prone entries.
+            if (Date.now() - this._lastListMs > FRAME_LIST_REFRESH_MS) {
+                this._refreshFrameList();
+            }
+
             const frames = this._cycleFrames;
             if (!frames || frames.length === 0) {
                 this._imgEl.classList.add('sa-hidden');
                 this._imgPlaceholder.classList.remove('sa-hidden');
+                this._imgPlaceholder.textContent =
+                    'Waiting for the slowtask to capture frames…';
                 if (this._captionEl) this._captionEl.textContent = '';
                 return;
             }
@@ -366,7 +624,9 @@ export class SlowAgentApp {
             }
             this._cycleIdx = (this._cycleIdx + 1) % frames.length;
         };
-        tick();
+
+        // Initial fetch + immediate tick so the first frame appears fast.
+        this._refreshFrameList().then(() => tick());
         this._cycleTimer = setInterval(tick, FRAME_CYCLE_MS);
     }
 
@@ -380,7 +640,6 @@ export class SlowAgentApp {
             const startW = leftCol.getBoundingClientRect().width;
             const total  = leftCol.parentElement.getBoundingClientRect().width;
 
-            // Veil so the iframe on the right can't swallow mousemove.
             const veil = document.createElement('div');
             veil.style.cssText = 'position:fixed;inset:0;cursor:col-resize;z-index:99999';
             document.body.appendChild(veil);
@@ -403,13 +662,11 @@ export class SlowAgentApp {
     // ── Header buttons ─────────────────────────────────────────────────── //
 
     _buildHeaderControls() {
-        // Reload — just refresh the iframe and image.
         const reloadBtn = document.createElement('button');
         reloadBtn.innerHTML = '&#x21bb;';
         reloadBtn.title     = 'Reload image and plots';
         reloadBtn.addEventListener('click', () => {
             if (this._iframeEl) this._iframeEl.src = this._plotURL();
-            // Force the image to re-fetch.
             if (this._imgEl?.src) {
                 this._imgEl.src = this._imgEl.src.split('&_t=')[0]
                                 + '&_t=' + Date.now();
@@ -418,7 +675,6 @@ export class SlowAgentApp {
         });
         this.frame.appendButton($(reloadBtn));
 
-        // Home
         const homeBtn = document.createElement('button');
         homeBtn.innerHTML = '&#x1f3e0;';
         homeBtn.title     = 'Home';
@@ -426,7 +682,6 @@ export class SlowAgentApp {
         this.frame.appendButton($(homeBtn));
         homeBtn.style.marginLeft = '1em';
 
-        // Help
         const docBtn = document.createElement('button');
         docBtn.innerHTML = '&#x2753;';
         docBtn.title     = 'Documents';

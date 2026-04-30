@@ -361,7 +361,13 @@ async def _extract_and_store(frames):
         logging.warning("slowagent: extractor unavailable; skipping LLM call")
         return
 
-    declared = {c['name'] for c in config.get('channels', [])}
+    # Only channels marked `connected: true` (or with no `connected` field —
+    # default true for backward compat) are extracted, written, or even
+    # mentioned to the LLM.  Defense in depth against the model returning
+    # values for un-wired channels.
+    all_channels       = config.get('channels', [])
+    connected_channels = [c for c in all_channels if c.get('connected', True)]
+    declared           = {c['name'] for c in connected_channels}
 
     # Dedup: same set of frames as the last successful extraction → skip
     # the LLM but still feed the plot from the cache.
@@ -378,17 +384,29 @@ async def _extract_and_store(frames):
                      len(frames), replayed)
         return
 
-    prompt   = config.get('llm', {}).get('prompt', '')
-    channels = config.get('channels', [])
+    prompt = config.get('llm', {}).get('prompt', '')
 
-    channel_block = '\n'.join(
+    if not connected_channels:
+        logging.warning("slowagent: no channels marked `connected` — skipping LLM call")
+        return
+
+    connected_block = '\n'.join(
         f"- \"{c['name']}\": {c.get('label') or c.get('description') or c['name']}"
-        for c in channels
+        for c in connected_channels
+    )
+    not_connected = [c['name'] for c in all_channels if not c.get('connected', True)]
+    not_connected_line = (
+        f"\n\nThe following channels are NOT connected — DO NOT report any "
+        f"value for them, return null even if you think you can read one: "
+        f"{', '.join(not_connected)}."
+        if not_connected else ''
     )
     full_prompt = (
         f"{prompt.strip()}\n\n"
-        f"Return a JSON object with exactly these keys (use null for any "
-        f"channel you cannot read in any frame):\n{channel_block}"
+        f"CONNECTED CHANNELS — return a JSON object with exactly these keys "
+        f"(use null for any channel whose value you cannot read with "
+        f"COMPLETE confidence in any frame):\n{connected_block}"
+        f"{not_connected_line}"
     )
 
     try:
@@ -399,7 +417,7 @@ async def _extract_and_store(frames):
 
     n_read = sum(1 for v in result.values.values() if v is not None)
     logging.info("slowagent: extracted %d/%d channels (model=%s)",
-                 n_read, len(channels), result.model)
+                 n_read, len(connected_channels), result.model)
 
     # Cache only on success — failures retry the same content next cycle.
     last_extracted_hashes = current_hashes
@@ -474,12 +492,20 @@ def _reload_config():
     if extractor is None or extractor._model != model or extractor._max_tokens != max_tok:
         try:
             globals()['extractor'] = ClaudeVisionExtractor(model=model, max_tokens=max_tok)
-        except slowagent.SecretError as e:
+        except (slowagent.SecretError, LLMError) as e:
             logging.error("slowagent: %s", e)
             globals()['extractor'] = None
 
-    logging.info("slowagent: config reloaded — %d channel(s)",
-                 len(config.get('channels', [])))
+    n_total     = len(config.get('channels', []))
+    n_connected = sum(1 for c in config.get('channels', [])
+                      if c.get('connected', True))
+    logging.info("slowagent: config reloaded — %d channel(s), %d connected",
+                 n_total, n_connected)
+
+    # Re-emit the auto-generated slowplot so toggling a channel's `connected`
+    # field promptly removes/adds its trace from the plot — without this,
+    # _maybe_update_slowplot only fires when a NEW channel first appears.
+    _maybe_update_slowplot()
 
 
 def _maybe_reload_config():
@@ -547,91 +573,15 @@ def _layout_basename():
 
 
 def _maybe_update_slowplot():
-    """Rewrite slowplot-{layout_name}.json so it lists ONLY the channels
-    we have ever seen non-null data for.  No-op if the file already
-    matches the current set — so this can be called every cycle without
-    churning the disk."""
-    if not config or not config_path or not seen_channels:
+    """Rewrite slowplot-{layout_name}.json so it lists exactly the channels
+    the user has marked `connected: true` (default true if absent).
+    Idempotent — only writes when the channel set or order changes.
+    Delegates to `slowagent.regenerate_slowplot`, which is also called
+    server-side from sd_agent.py whenever the user toggles a checkbox so
+    the UI sees the change before the slowtask's next config-poll fires."""
+    if not config_path:
         return
-
-    layout_name   = _layout_basename()
-    slowplot_path = os.path.join(os.path.dirname(config_path),
-                                 f'slowplot-{layout_name}.json')
-
-    declared = config.get('channels', [])
-    visible  = [c for c in declared if c['name'] in seen_channels]
-    visible_names = [c['name'] for c in visible]
-
-    if not visible:
-        return
-
-    # Skip if the existing slowplot already has exactly these channels in
-    # this order — avoids touching the file every cycle.
-    try:
-        with open(slowplot_path) as f:
-            existing = json.load(f)
-        existing_names = [p.get('channel') for p in
-                          (existing.get('panels') or [{}])[0].get('plots', [])]
-        if existing_names == visible_names:
-            return
-    except (OSError, ValueError, KeyError):
-        pass
-
-    plot_cfg = config.get('plot', {})
-    plots = []
-    for c in visible:
-        plots.append({
-            "type":          "timeseries",
-            "channel":       c['name'],
-            "color":         c.get('color', '#666'),
-            "label":         c.get('label', c['name']),
-            "format":        "%.1f",
-            "opacity":       1,
-            "marker_type":   "circle",
-            "marker_size":   3,
-            "line_width":    1,
-            "line_type":     "connect",
-            "fill_opacity":  0,
-            "fill_envelope": False,
-            "fill_baseline": 1e-100,
-        })
-
-    title = config.get('meta', {}).get('title', layout_name)
-    doc = {
-        "control": {
-            "range":  {"length": int(plot_cfg.get('length', 86400)), "to": 0},
-            "reload": int(plot_cfg.get('reload', 5)),
-            "mode":   "normal",
-            "grid":   {"rows": 1, "columns": 1},
-        },
-        "style":  {},
-        "panels": [{
-            "type":   "timeseries",
-            "plots":  plots,
-            "axes":   {
-                "xfixed": False, "yfixed": False,
-                "xlog":   False, "ylog":   False, "zlog": False,
-                "ymin": 0, "ymax": 200,
-                "title":  "Zone Temperatures (°C)",
-                "ytitle": "Temperature (°C)",
-            },
-            "legend": {"style": "transparent", "position": "left"},
-        }],
-        "meta": {
-            "name":        layout_name,
-            "title":       f"{title} — Live Plot",
-            "description": "Auto-generated by slowtask-webcam_ocr.py from the channels seen so far.",
-        },
-    }
-
-    try:
-        with open(slowplot_path, 'w') as f:
-            json.dump(doc, f, indent=2)
-        logging.info("slowagent: rewrote %s with %d channel(s): %s",
-                     os.path.basename(slowplot_path), len(visible),
-                     ', '.join(visible_names))
-    except OSError as e:
-        logging.warning("slowagent: cannot write %s: %s", slowplot_path, e)
+    slowagent.regenerate_slowplot(config_path)
 
 
 def _trigger_slowdash_rescan():

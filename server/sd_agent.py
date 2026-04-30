@@ -13,12 +13,25 @@
 # only thing that actually talks to the LLM or writes to the datastore.
 
 import os
+import sys
 import glob
 import json
 import logging
 import urllib.parse
 
 import slowlette
+
+# slowagent ships in the submodule's `lib/`; if slowdash is running in a
+# venv that doesn't expose lib/slowpy on sys.path, fall back to importing
+# from the submodule directly via this file's realpath.  Same dance as
+# slowtask-webcam_ocr.py.
+_AGENT_LIB = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), '..', 'lib'
+))
+if os.path.isdir(os.path.join(_AGENT_LIB, 'slowagent')) and _AGENT_LIB not in sys.path:
+    sys.path.insert(0, _AGENT_LIB)
+
+import slowagent
 
 
 # Slowdash chdirs to the project directory before loading user modules
@@ -68,10 +81,48 @@ async def list_agent_layouts():
 
 @app.post('/api/agent/prompt/{layout_file}')
 async def update_prompt(layout_file: str, body: slowlette.JSON):
-    """Patch only the `llm.prompt` field of a layout file.  Leaves every
-    other setting (channels, capture rate, …) untouched.  The slowtask polls
-    the file mtime and reloads on change, so updates take effect within a
-    couple of seconds without restarting the task."""
+    """Patch only the `llm.prompt` field of a layout file.  Kept as a
+    distinct endpoint for backward compat with older front-ends; new code
+    should POST to /api/agent/settings/{layout_file}.  Body: {"prompt": "..."}."""
+    data = _unwrap_json(body)
+    if not isinstance(data, dict) or 'prompt' not in data:
+        return slowlette.Response(status_code=400,
+                                  content=b'expected JSON {"prompt": "..."}')
+    return await _patch_layout(layout_file, {'prompt': data['prompt']})
+
+
+@app.post('/api/agent/settings/{layout_file}')
+async def update_settings(layout_file: str, body: slowlette.JSON):
+    """Patch a curated subset of fields in a layout file.  Recognised keys:
+
+      - prompt           (str) -> `llm.prompt`
+      - cycle_seconds    (number 1..86400) -> `capture.cycle_seconds`
+      - connected        ({channel_name: bool}) -> sets `connected` on each
+                          matching channel object in `channels[]`
+
+    Unknown keys are ignored.  All-or-nothing write — the file is rewritten
+    only if the patch is well-formed.  The slowtask polls the file mtime and
+    reloads on change, so updates take effect within a couple of seconds.
+    """
+    data = _unwrap_json(body)
+    if not isinstance(data, dict):
+        return slowlette.Response(status_code=400, content=b'expected JSON object')
+    return await _patch_layout(layout_file, data)
+
+
+def _unwrap_json(body):
+    """slowlette.JSON is a wrapper class that proxies dict/list operations
+    via __contains__/__getitem__/get(), but it is NOT itself a `dict` —
+    so `isinstance(body, dict)` is always False even for a perfectly good
+    JSON object.  Reach through to the underlying parsed structure."""
+    if body is None:
+        return None
+    if hasattr(body, 'value'):
+        return body.value()
+    return body
+
+
+async def _patch_layout(layout_file: str, patch: dict):
     if not _safe_layout_filename(layout_file):
         return slowlette.Response(status_code=400, content=b'bad layout file name')
 
@@ -86,12 +137,43 @@ async def update_prompt(layout_file: str, body: slowlette.JSON):
         return slowlette.Response(status_code=500,
                                   content=f'cannot read layout: {e}'.encode())
 
-    new_prompt = body.get('prompt') if body is not None else None
-    if not isinstance(new_prompt, str):
-        return slowlette.Response(status_code=400,
-                                  content=b'expected JSON {"prompt": "..."}')
+    applied = []
 
-    doc.setdefault('llm', {})['prompt'] = new_prompt
+    if 'prompt' in patch:
+        if not isinstance(patch['prompt'], str):
+            return slowlette.Response(status_code=400, content=b'prompt must be a string')
+        doc.setdefault('llm', {})['prompt'] = patch['prompt']
+        applied.append('prompt')
+
+    if 'cycle_seconds' in patch:
+        try:
+            cs = float(patch['cycle_seconds'])
+        except (TypeError, ValueError):
+            return slowlette.Response(status_code=400, content=b'cycle_seconds must be a number')
+        if not (1.0 <= cs <= 86400.0):
+            return slowlette.Response(
+                status_code=400,
+                content=b'cycle_seconds must be between 1 and 86400 (1 day)'
+            )
+        doc.setdefault('capture', {})['cycle_seconds'] = cs
+        applied.append('cycle_seconds')
+
+    if 'connected' in patch:
+        flags = patch['connected']
+        if not isinstance(flags, dict):
+            return slowlette.Response(status_code=400, content=b'connected must be an object')
+        for ch in doc.get('channels', []):
+            name = ch.get('name')
+            if name in flags:
+                ch['connected'] = bool(flags[name])
+        applied.append('connected')
+
+    if not applied:
+        return slowlette.Response(
+            status_code=400,
+            content=b'no recognised fields in patch (expected prompt, cycle_seconds, or connected)'
+        )
+
     try:
         with open(path, 'w') as f:
             json.dump(doc, f, indent=2)
@@ -99,7 +181,23 @@ async def update_prompt(layout_file: str, body: slowlette.JSON):
         return slowlette.Response(status_code=500,
                                   content=f'cannot write layout: {e}'.encode())
 
-    return {'ok': True, 'file': layout_file}
+    # If the connected list changed, rewrite slowplot-NAME.json right now
+    # so the UI sees the new channel set on the very next iframe load —
+    # without waiting for the slowtask's next config-poll cycle (which can
+    # be blocked for 20+ seconds by an in-flight LLM call).
+    slowplot_changed = False
+    if 'connected' in applied:
+        try:
+            slowplot_changed = slowagent.regenerate_slowplot(path)
+        except Exception as e:
+            logging.warning("sd_agent: slowplot regen failed: %s", e)
+
+    return {
+        'ok':                True,
+        'file':              layout_file,
+        'applied':           applied,
+        'slowplot_changed':  slowplot_changed,
+    }
 
 
 # ── Cycling-frames display ──────────────────────────────────────────────── #
