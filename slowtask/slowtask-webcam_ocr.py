@@ -401,12 +401,37 @@ async def _extract_and_store(frames):
         f"{', '.join(not_connected)}."
         if not_connected else ''
     )
+
+    # Tell the LLM the physically-valid range for each channel (taken from
+    # the layout's plot bounds — they double as sanity bounds).  Anything
+    # outside this is the model misreading a digit.
+    range_lines = []
+    for c in connected_channels:
+        ymin, ymax = c.get('ymin'), c.get('ymax')
+        if ymin is not None and ymax is not None:
+            range_lines.append(
+                f"  - {c['name']}: physically valid range {ymin}–{ymax} °C "
+                f"(any value outside is unphysical — return null)"
+            )
+    range_block = (
+        f"\n\nPHYSICALLY VALID RANGES — values outside these are impossible "
+        f"on the real instrument and should be returned as null:\n"
+        + '\n'.join(range_lines)
+    ) if range_lines else ''
+
     full_prompt = (
         f"{prompt.strip()}\n\n"
         f"CONNECTED CHANNELS — return a JSON object with exactly these keys "
         f"(use null for any channel whose value you cannot read with "
         f"COMPLETE confidence in any frame):\n{connected_block}"
         f"{not_connected_line}"
+        f"{range_block}"
+        f"\n\nMULTI-FRAME AGREEMENT — only return a numeric value for a "
+        f"channel if you see at least TWO frames in this batch that agree "
+        f"on that value (same digits, same channel-tag suffix visible in "
+        f"the same frame).  A single frame showing a value, with no other "
+        f"frame confirming it, is NOT enough — return null in that case.  "
+        f"This rule exists to filter out single-frame OCR mistakes."
     )
 
     try:
@@ -415,22 +440,65 @@ async def _extract_and_store(frames):
         logging.warning("slowagent: extraction failed: %s", e)
         return
 
-    n_read = sum(1 for v in result.values.values() if v is not None)
+    n_raw = sum(1 for v in result.values.values() if v is not None)
     logging.info("slowagent: extracted %d/%d channels (model=%s)",
-                 n_read, len(connected_channels), result.model)
+                 n_raw, len(connected_channels), result.model)
 
-    # Cache only on success — failures retry the same content next cycle.
+    # ── Server-side validation ──────────────────────────────────────────── #
+    # The LLM is told to obey ymin/ymax and multi-frame agreement, but we
+    # don't trust soft instructions to be sufficient.  Filter again here:
+    #   1. Drop values outside [ymin, ymax] (uses the layout's plot bounds
+    #      as physical bounds — same field, dual purpose).
+    #   2. Drop values whose change-from-previous exceeds an optional
+    #      per-channel `max_delta_per_cycle` (off unless the layout
+    #      explicitly sets it; useful for spike rejection within bounds).
+    channels_by_name = {c['name']: c for c in connected_channels}
+    validated = {}
+    for name, value in result.values.items():
+        if value is None or name not in declared:
+            if value is not None and name not in declared:
+                logging.warning("slowagent: dropping %s=%s (channel not declared / not connected)",
+                                name, value)
+            continue
+
+        ch   = channels_by_name.get(name, {})
+        ymin = ch.get('ymin')
+        ymax = ch.get('ymax')
+        if ymin is not None and value < ymin:
+            logging.warning("slowagent: dropping %s=%s (below ymin=%s — likely OCR error)",
+                            name, value, ymin)
+            continue
+        if ymax is not None and value > ymax:
+            logging.warning("slowagent: dropping %s=%s (above ymax=%s — likely OCR error)",
+                            name, value, ymax)
+            continue
+
+        max_delta = ch.get('max_delta_per_cycle')
+        if max_delta is not None:
+            prev = last_extracted_values.get(name)
+            if prev is not None and abs(value - prev) > float(max_delta):
+                logging.warning(
+                    "slowagent: dropping %s=%s (jumped %+.1f from %s, > "
+                    "max_delta_per_cycle=%s — likely OCR spike)",
+                    name, value, value - prev, prev, max_delta
+                )
+                continue
+
+        validated[name] = value
+
+    # Cache validated values for dedup-replay AND for next cycle's
+    # rate-of-change check.  Rejected values are NOT cached, so a single
+    # spike doesn't poison the rate baseline.
     last_extracted_hashes = current_hashes
-    last_extracted_values = {n: v for n, v in result.values.items()
-                             if n in declared and v is not None}
+    last_extracted_values = validated
+
+    n_kept = len(validated)
+    if n_kept != n_raw:
+        logging.info("slowagent: %d/%d value(s) survived validation",
+                     n_kept, n_raw)
 
     new_channel_seen = False
-    for name, value in result.values.items():
-        if value is None:
-            continue
-        if name not in declared:
-            logging.warning("slowagent: LLM returned undeclared channel %s", name)
-            continue
+    for name, value in validated.items():
         datastore_ts.append(value, tag=name)
         if name not in seen_channels:
             seen_channels.add(name)

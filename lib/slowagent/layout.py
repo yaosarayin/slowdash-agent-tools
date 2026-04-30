@@ -1,4 +1,4 @@
-lib/slowagent/layout.py# layout.py — slowplot regeneration helper.
+# lib/slowagent/layout.py — slowplot regeneration helper.
 #
 # The slowtask owns the auto-generated `slowplot-NAME.json` file: it lists
 # the channels the user has marked `connected: true` in `slowagent-NAME.json`.
