@@ -12,10 +12,12 @@
 #
 # Runtime behaviour, all driven by the layout JSON:
 #
-#   - For HTTP sources (`source: http://…`), every `cycle_seconds` we wipe
-#     `batch_dir` (default `last_images`), capture `frames_per_cycle` frames
-#     pacing them by `frame_interval` seconds, save each one with a
-#     timestamped filename, and run the LLM on the whole batch.
+#   - For HTTP sources (`source: http://…`), every `cycle_seconds` we capture
+#     `frames_per_cycle` frames pacing them by `frame_interval` seconds, save
+#     each one with a timestamped filename, run the LLM on the whole batch,
+#     and delete the image files only after the LLM extracts at least one
+#     value.  On API error or all-null extraction the images stay on disk and
+#     the next cycle retries them instead of capturing fresh frames.
 #   - For file:// sources (testing / demo), every cycle we re-read whatever
 #     image files are currently in the directory and run the LLM on them
 #     (the directory is never modified — those files are user-supplied
