@@ -82,6 +82,11 @@ project_dir   = None     # for resolving relative paths
 # Pacing.
 last_cycle_start = 0     # monotonic time the last cycle began
 
+# Timestamp of the most recent HTTP capture batch (Unix time).  Persists across
+# retry cycles so the database row reflects when the image was taken, not when
+# the LLM finally processed it.
+last_capture_time = None
+
 # Dedup: skip the LLM call when this batch's frame hashes match the previous
 # successful batch.  Cleared on config reload so prompt changes always
 # trigger a fresh extraction.
@@ -181,7 +186,7 @@ async def force_refresh():
 
 async def _run_cycle():
     """One full pass: capture (or re-read) a batch, run LLM, write data."""
-    global last_cycle_start, last_cycle_llm_success
+    global last_cycle_start, last_cycle_llm_success, last_capture_time
     last_cycle_start = time.monotonic()
 
     if webcam is None:
@@ -189,17 +194,19 @@ async def _run_cycle():
         return
 
     src = config['capture']['source']
+    saved_paths = []
     if src.startswith('http://') or src.startswith('https://'):
         if last_cycle_llm_success:
-            frames = await _capture_batch_http()
+            frames, saved_paths = await _capture_batch_http()
         else:
-            # Last LLM call failed (e.g. rate limit) — retry with the images
-            # still on disk instead of wiping them and capturing new ones.
-            frames = _read_dir_frames(webcam.display_dir)
+            # Last LLM call failed — retry with the images still on disk
+            # instead of wiping them and capturing new ones.
+            saved_paths = _list_image_paths(webcam.display_dir)
+            frames = _read_path_frames(saved_paths)
             logging.info("slowagent: retrying %d on-disk frame(s) after LLM failure",
                          len(frames))
             if not frames:
-                frames = await _capture_batch_http()
+                frames, saved_paths = await _capture_batch_http()
     else:
         frames = _read_dir_frames(webcam.display_dir)
 
@@ -207,21 +214,29 @@ async def _run_cycle():
         logging.warning("slowagent: no frames captured this cycle")
         return
 
-    last_cycle_llm_success = await _extract_and_store(frames)
+    success = await _extract_and_store(frames, capture_time=last_capture_time)
+    last_cycle_llm_success = success
+    if success and saved_paths:
+        _delete_image_files(saved_paths)
+    elif not success and saved_paths:
+        logging.info("slowagent: %d image(s) kept on disk — LLM did not extract "
+                     "values, will retry next cycle:\n  %s",
+                     len(saved_paths), '\n  '.join(saved_paths))
 
 
 async def _capture_batch_http():
     """Capture `frames_per_cycle` frames from the HTTP webcam, pacing by
-    `frame_interval` seconds.  Wipes `batch_dir` first, then writes each
-    captured frame with a timestamped name so the dashboard cycler shows
-    the latest batch."""
+    `frame_interval` seconds.  Writes each frame with a timestamped name;
+    files are deleted only after the LLM successfully extracts values."""
+    global last_capture_time
     cap = config['capture']
     n        = int(cap.get('frames_per_cycle', 14))
     interval = float(cap.get('frame_interval', 1.5))
     batch_dir = webcam.display_dir   # set by _resolve_capture_paths
 
+    last_capture_time = time.time()   # record before first frame hits the wire
+
     if batch_dir:
-        _wipe_image_dir(batch_dir)
         try:
             os.makedirs(batch_dir, exist_ok=True)
         except OSError as e:
@@ -234,6 +249,7 @@ async def _capture_batch_http():
 
     ts_prefix = time.strftime('%Y%m%d-%H%M%S')
     frames = []
+    saved_paths = []
     for i in range(n):
         # Some HTTP cameras (notably the picamera2 photo.cgi bundled with
         # slowdash) intermittently fail to acquire the device when another
@@ -280,9 +296,12 @@ async def _capture_batch_http():
 
         fname = f"{ts_prefix}-{i + 1:03d}{ext}"
         if batch_dir:
+            fpath = os.path.join(batch_dir, fname)
             try:
-                with open(os.path.join(batch_dir, fname), 'wb') as f:
+                with open(fpath, 'wb') as f:
                     f.write(blob_small)
+                saved_paths.append(fpath)
+                logging.info("slowagent: saved frame %d/%d → %s", i + 1, n, fname)
             except OSError as e:
                 logging.warning("slowagent: cannot save %s: %s", fname, e)
         frames.append(blob_small)
@@ -293,7 +312,7 @@ async def _capture_batch_http():
     total_kb = sum(len(b) for b in frames) // 1024
     logging.info("slowagent: captured %d/%d frame(s) (%d KB total) into %s",
                  len(frames), n, total_kb, batch_dir or '(memory only)')
-    return frames
+    return frames, saved_paths
 
 
 def _downsize(blob: bytes, max_dim: int, quality: int):
@@ -345,31 +364,56 @@ def _read_dir_frames(path):
     return frames
 
 
-def _wipe_image_dir(path):
-    """Delete every image file under `path` (non-recursive — the slowtask
-    writes flat into the batch dir).  Logs but does not raise on errors."""
+def _list_image_paths(path):
+    """Return sorted list of image file paths in `path`."""
     if not path or not os.path.isdir(path):
-        return
-    for f in os.listdir(path):
-        if not f.lower().endswith(_IMAGE_EXTS):
-            continue
+        return []
+    return [
+        os.path.join(path, f)
+        for f in sorted(os.listdir(path))
+        if f.lower().endswith(_IMAGE_EXTS)
+    ]
+
+
+def _read_path_frames(paths):
+    """Read image bytes from a specific list of file paths."""
+    frames = []
+    for p in paths:
         try:
-            os.remove(os.path.join(path, f))
+            with open(p, 'rb') as fp:
+                frames.append(fp.read())
         except OSError as e:
-            logging.warning("slowagent: cannot remove %s: %s", f, e)
+            logging.warning("slowagent: cannot read %s: %s", p, e)
+    return frames
+
+
+def _delete_image_files(paths):
+    """Delete image files after successful LLM extraction."""
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError as e:
+            logging.warning("slowagent: cannot remove %s: %s", p, e)
 
 
 # ── LLM extraction ──────────────────────────────────────────────────────── #
 
-async def _extract_and_store(frames):
+async def _extract_and_store(frames, capture_time=None):
     """Send `frames` (list[bytes]) to Claude, parse the JSON response, and
     write each extracted channel value to the datastore.
+
+    `capture_time` is the Unix timestamp of when the images were taken; rows
+    are written with this timestamp so the DB reflects measurement time, not
+    LLM processing time.  Pass None for file:// sources.
 
     On dedup hit (same frames as last cycle), we don't call the LLM — but
     we DO re-write the cached values with the current timestamp so the
     plot keeps a continuous trace.  The new rows are labelled the same as
     the originals; their fresh timestamps just reflect "as of now, the
-    temperature was still X"."""
+    temperature was still X".
+
+    Returns True if at least one value was extracted or deduped; False if the
+    LLM call failed or returned all-null (images should be kept for retry)."""
     global last_extracted_hashes, last_extracted_values
 
     if extractor is None:
@@ -504,20 +548,24 @@ async def _extract_and_store(frames):
 
         validated[name] = value
 
+    n_kept = len(validated)
+    if n_kept != n_raw:
+        logging.info("slowagent: %d/%d value(s) survived validation",
+                     n_kept, n_raw)
+
+    if not validated:
+        logging.warning("slowagent: no values extracted — images kept on disk for retry")
+        return False
+
     # Cache validated values for dedup-replay AND for next cycle's
     # rate-of-change check.  Rejected values are NOT cached, so a single
     # spike doesn't poison the rate baseline.
     last_extracted_hashes = current_hashes
     last_extracted_values = validated
 
-    n_kept = len(validated)
-    if n_kept != n_raw:
-        logging.info("slowagent: %d/%d value(s) survived validation",
-                     n_kept, n_raw)
-
     new_channel_seen = False
     for name, value in validated.items():
-        datastore_ts.append(value, tag=name)
+        datastore_ts.append(value, tag=name, timestamp=capture_time)
         if name not in seen_channels:
             seen_channels.add(name)
             new_channel_seen = True
