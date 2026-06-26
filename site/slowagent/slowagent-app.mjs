@@ -276,10 +276,15 @@ export class SlowAgentApp {
             return { row, inp, btn };
         };
 
+        const _minCycle = () => {
+            const fi  = this.config?.capture?.frame_interval  ?? 1.0;
+            const fpc = this.config?.capture?.frames_per_cycle ?? 5;
+            return Math.round(fi * fpc * 10) / 10;   // round to 0.1 s
+        };
         const cycleRow = _makeRow(
             'Batch every',
             this.config?.capture?.cycle_seconds ?? 30,
-            5, 86400, 1,
+            _minCycle(), 86400, 0.1,
             'Save the new refresh rate to ' + this.configFile + '. The slowtask picks it up within a few seconds.'
         );
         const cycleUnit = document.createElement('span');
@@ -319,7 +324,7 @@ export class SlowAgentApp {
         const hint = document.createElement('div');
         hint.className = 'sa-hint';
         hint.textContent =
-            'Batch every: how often a new batch starts (min 5 s). '
+            'Batch every: how often a new batch starts (min = interval × frames). '
           + 'Frames per batch: photos taken each cycle. '
           + 'Interval: seconds between individual frames. '
           + 'All values are saved to the layout file and picked up by the slowtask within a few seconds.';
@@ -542,8 +547,12 @@ export class SlowAgentApp {
 
     async _saveCycleSeconds() {
         const cs = parseFloat(this._cycleInput.value);
-        if (!isFinite(cs) || cs < 5 || cs > 86400) {
-            this._setCycleStatus('Enter a number between 5 and 86400 seconds.', true);
+        const fi  = this.config?.capture?.frame_interval  ?? 1.0;
+        const fpc = this.config?.capture?.frames_per_cycle ?? 5;
+        const minCycle = Math.round(fi * fpc * 10) / 10;
+        if (!isFinite(cs) || cs < minCycle || cs > 86400) {
+            this._setCycleStatus(
+                `Enter a number between ${minCycle} (interval × frames) and 86400 seconds.`, true);
             return;
         }
         this._setCycleStatus('Saving…');

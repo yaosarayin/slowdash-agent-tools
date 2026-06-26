@@ -96,7 +96,7 @@ async def update_settings(layout_file: str, body: slowlette.JSON):
     """Patch a curated subset of fields in a layout file.  Recognised keys:
 
       - prompt            (str) -> `llm.prompt`
-      - cycle_seconds     (number 1..86400) -> `capture.cycle_seconds`
+      - cycle_seconds     (number ≥ frame_interval×frames_per_cycle, ≤86400) -> `capture.cycle_seconds`
       - frames_per_cycle  (int 1..60)       -> `capture.frames_per_cycle`
       - frame_interval    (number 0.1..60)  -> `capture.frame_interval`
       - connected         ({channel_name: bool}) -> sets `connected` on each
@@ -152,10 +152,14 @@ async def _patch_layout(layout_file: str, patch: dict):
             cs = float(patch['cycle_seconds'])
         except (TypeError, ValueError):
             return slowlette.Response(status_code=400, content=b'cycle_seconds must be a number')
-        if not (1.0 <= cs <= 86400.0):
+        cap = doc.get('capture', {})
+        fi      = float(cap.get('frame_interval',  1.5))
+        fpc     = int(cap.get('frames_per_cycle', 5))
+        min_cs  = round(fi * fpc, 6)
+        if not (min_cs <= cs <= 86400.0):
             return slowlette.Response(
                 status_code=400,
-                content=b'cycle_seconds must be between 1 and 86400 (1 day)'
+                content=f'cycle_seconds must be between {min_cs} (frame_interval × frames_per_cycle) and 86400'.encode()
             )
         doc.setdefault('capture', {})['cycle_seconds'] = cs
         applied.append('cycle_seconds')
