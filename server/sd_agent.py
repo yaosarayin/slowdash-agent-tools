@@ -95,10 +95,12 @@ async def update_prompt(layout_file: str, body: slowlette.JSON):
 async def update_settings(layout_file: str, body: slowlette.JSON):
     """Patch a curated subset of fields in a layout file.  Recognised keys:
 
-      - prompt           (str) -> `llm.prompt`
-      - cycle_seconds    (number 1..86400) -> `capture.cycle_seconds`
-      - connected        ({channel_name: bool}) -> sets `connected` on each
-                          matching channel object in `channels[]`
+      - prompt            (str) -> `llm.prompt`
+      - cycle_seconds     (number 1..86400) -> `capture.cycle_seconds`
+      - frames_per_cycle  (int 1..60)       -> `capture.frames_per_cycle`
+      - frame_interval    (number 0.1..60)  -> `capture.frame_interval`
+      - connected         ({channel_name: bool}) -> sets `connected` on each
+                           matching channel object in `channels[]`
 
     Unknown keys are ignored.  All-or-nothing write — the file is rewritten
     only if the patch is well-formed.  The slowtask polls the file mtime and
@@ -158,6 +160,30 @@ async def _patch_layout(layout_file: str, patch: dict):
         doc.setdefault('capture', {})['cycle_seconds'] = cs
         applied.append('cycle_seconds')
 
+    if 'frames_per_cycle' in patch:
+        try:
+            fpc = int(patch['frames_per_cycle'])
+        except (TypeError, ValueError):
+            return slowlette.Response(status_code=400,
+                                      content=b'frames_per_cycle must be an integer')
+        if not (1 <= fpc <= 60):
+            return slowlette.Response(status_code=400,
+                                      content=b'frames_per_cycle must be between 1 and 60')
+        doc.setdefault('capture', {})['frames_per_cycle'] = fpc
+        applied.append('frames_per_cycle')
+
+    if 'frame_interval' in patch:
+        try:
+            fi = float(patch['frame_interval'])
+        except (TypeError, ValueError):
+            return slowlette.Response(status_code=400,
+                                      content=b'frame_interval must be a number')
+        if not (0.1 <= fi <= 60.0):
+            return slowlette.Response(status_code=400,
+                                      content=b'frame_interval must be between 0.1 and 60 seconds')
+        doc.setdefault('capture', {})['frame_interval'] = fi
+        applied.append('frame_interval')
+
     if 'connected' in patch:
         flags = patch['connected']
         if not isinstance(flags, dict):
@@ -171,7 +197,7 @@ async def _patch_layout(layout_file: str, patch: dict):
     if not applied:
         return slowlette.Response(
             status_code=400,
-            content=b'no recognised fields in patch (expected prompt, cycle_seconds, or connected)'
+            content=b'no recognised fields in patch (expected prompt, cycle_seconds, frames_per_cycle, frame_interval, or connected)'
         )
 
     try:

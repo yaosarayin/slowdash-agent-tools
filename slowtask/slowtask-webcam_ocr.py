@@ -99,6 +99,12 @@ last_extracted_values = {}
 # list.
 seen_channels = set()
 
+# True after a successful (or deduped) LLM call; False after a transient
+# LLM error (e.g. rate limit).  When False, _run_cycle retries the images
+# still on disk instead of wiping and recapturing, so a transient API
+# failure doesn't silently discard a reading.
+last_cycle_llm_success = True
+
 _IMAGE_EXTS = ('.jpg', '.jpeg', '.png')
 
 
@@ -175,7 +181,7 @@ async def force_refresh():
 
 async def _run_cycle():
     """One full pass: capture (or re-read) a batch, run LLM, write data."""
-    global last_cycle_start
+    global last_cycle_start, last_cycle_llm_success
     last_cycle_start = time.monotonic()
 
     if webcam is None:
@@ -184,7 +190,16 @@ async def _run_cycle():
 
     src = config['capture']['source']
     if src.startswith('http://') or src.startswith('https://'):
-        frames = await _capture_batch_http()
+        if last_cycle_llm_success:
+            frames = await _capture_batch_http()
+        else:
+            # Last LLM call failed (e.g. rate limit) — retry with the images
+            # still on disk instead of wiping them and capturing new ones.
+            frames = _read_dir_frames(webcam.display_dir)
+            logging.info("slowagent: retrying %d on-disk frame(s) after LLM failure",
+                         len(frames))
+            if not frames:
+                frames = await _capture_batch_http()
     else:
         frames = _read_dir_frames(webcam.display_dir)
 
@@ -192,7 +207,7 @@ async def _run_cycle():
         logging.warning("slowagent: no frames captured this cycle")
         return
 
-    await _extract_and_store(frames)
+    last_cycle_llm_success = await _extract_and_store(frames)
 
 
 async def _capture_batch_http():
@@ -359,7 +374,7 @@ async def _extract_and_store(frames):
 
     if extractor is None:
         logging.warning("slowagent: extractor unavailable; skipping LLM call")
-        return
+        return True   # config issue, not a transient failure — allow fresh capture next cycle
 
     # Only channels marked `connected: true` (or with no `connected` field —
     # default true for backward compat) are extracted, written, or even
@@ -382,13 +397,13 @@ async def _extract_and_store(frames):
         logging.info("slowagent: %d frame(s) unchanged — skipped LLM, "
                      "replayed %d cached channel(s) into the plot",
                      len(frames), replayed)
-        return
+        return True
 
     prompt = config.get('llm', {}).get('prompt', '')
 
     if not connected_channels:
         logging.warning("slowagent: no channels marked `connected` — skipping LLM call")
-        return
+        return True   # config issue — allow fresh capture next cycle
 
     connected_block = '\n'.join(
         f"- \"{c['name']}\": {c.get('label') or c.get('description') or c['name']}"
@@ -405,12 +420,15 @@ async def _extract_and_store(frames):
     # Tell the LLM the physically-valid range for each channel (taken from
     # the layout's plot bounds — they double as sanity bounds).  Anything
     # outside this is the model misreading a digit.
+    import re as _re
     range_lines = []
     for c in connected_channels:
         ymin, ymax = c.get('ymin'), c.get('ymax')
         if ymin is not None and ymax is not None:
+            _m = _re.search(r'\(([^)]+)\)', c.get('label', ''))
+            unit = _m.group(1) if _m else 'units'
             range_lines.append(
-                f"  - {c['name']}: physically valid range {ymin}–{ymax} °C "
+                f"  - {c['name']}: physically valid range {ymin}–{ymax} {unit} "
                 f"(any value outside is unphysical — return null)"
             )
     range_block = (
@@ -438,7 +456,7 @@ async def _extract_and_store(frames):
         result = await extractor.extract(frames, full_prompt)
     except LLMError as e:
         logging.warning("slowagent: extraction failed: %s", e)
-        return
+        return False
 
     n_raw = sum(1 for v in result.values.values() if v is not None)
     logging.info("slowagent: extracted %d/%d channels (model=%s)",
@@ -512,6 +530,8 @@ async def _extract_and_store(frames):
     if new_channel_seen:
         _maybe_update_slowplot()
         _trigger_slowdash_rescan()
+
+    return True
 
 
 # ── Config loading ──────────────────────────────────────────────────────── #

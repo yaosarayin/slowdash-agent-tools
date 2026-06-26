@@ -58,6 +58,11 @@ export class SlowAgentApp {
 
         // Settings controls
         this._cycleInput      = null;
+        this._cycleApplyBtn   = null;
+        this._framesInput     = null;
+        this._framesApplyBtn  = null;
+        this._intervalInput   = null;
+        this._intervalApplyBtn = null;
         this._cycleStatus     = null;
         this._channelChecks   = {};   // {channelName: <input type=checkbox>}
         this._channelStatus   = null;
@@ -248,52 +253,85 @@ export class SlowAgentApp {
         hdr.textContent = 'Capture Cadence';
         wrap.appendChild(hdr);
 
-        const row = document.createElement('div');
-        row.className = 'sa-capture-row';
+        const _makeRow = (labelText, value, min, max, step, applyTitle) => {
+            const row   = document.createElement('div');
+            row.className = 'sa-capture-row';
+            const lbl   = document.createElement('span');
+            lbl.className = 'sa-capture-lbl';
+            lbl.textContent = labelText;
+            const inp   = document.createElement('input');
+            inp.type = 'number';
+            inp.min  = String(min);
+            inp.max  = String(max);
+            inp.step = String(step);
+            inp.className = 'sa-capture-input';
+            inp.value = String(value);
+            const btn   = document.createElement('button');
+            btn.className = 'sa-btn';
+            btn.textContent = 'Apply';
+            btn.title = applyTitle;
+            row.appendChild(lbl);
+            row.appendChild(inp);
+            row.appendChild(btn);
+            return { row, inp, btn };
+        };
 
-        const lbl = document.createElement('span');
-        lbl.className = 'sa-capture-lbl';
-        lbl.textContent = 'Refresh every';
+        const cycleRow = _makeRow(
+            'Batch every',
+            this.config?.capture?.cycle_seconds ?? 30,
+            5, 86400, 1,
+            'Save the new refresh rate to ' + this.configFile + '. The slowtask picks it up within a few seconds.'
+        );
+        const cycleUnit = document.createElement('span');
+        cycleUnit.className = 'sa-capture-unit';
+        cycleUnit.textContent = 'seconds';
+        cycleRow.row.insertBefore(cycleUnit, cycleRow.btn);
+        wrap.appendChild(cycleRow.row);
 
-        const input = document.createElement('input');
-        input.type = 'number';
-        input.min = '5';
-        input.max = '86400';
-        input.step = '1';
-        input.className = 'sa-capture-input';
-        input.value = String(this.config?.capture?.cycle_seconds ?? 30);
+        const framesRow = _makeRow(
+            'Frames per batch',
+            this.config?.capture?.frames_per_cycle ?? 5,
+            1, 60, 1,
+            'How many photos to take per cycle. Saved to ' + this.configFile + '.'
+        );
+        const framesUnit = document.createElement('span');
+        framesUnit.className = 'sa-capture-unit';
+        framesUnit.textContent = 'frames';
+        framesRow.row.insertBefore(framesUnit, framesRow.btn);
+        wrap.appendChild(framesRow.row);
 
-        const unit = document.createElement('span');
-        unit.className = 'sa-capture-unit';
-        unit.textContent = 'seconds';
-
-        const btn = document.createElement('button');
-        btn.className = 'sa-btn';
-        btn.textContent = 'Apply';
-        btn.title = 'Save the new refresh rate to ' + this.configFile + '. '
-                  + 'The slowtask picks it up within a few seconds.';
+        const intervalRow = _makeRow(
+            'Interval between frames',
+            this.config?.capture?.frame_interval ?? 1.0,
+            0.1, 60, 0.1,
+            'Seconds between each frame within a batch. Saved to ' + this.configFile + '.'
+        );
+        const intervalUnit = document.createElement('span');
+        intervalUnit.className = 'sa-capture-unit';
+        intervalUnit.textContent = 'seconds';
+        intervalRow.row.insertBefore(intervalUnit, intervalRow.btn);
+        wrap.appendChild(intervalRow.row);
 
         const status = document.createElement('span');
         status.className = 'sa-prompt-status sa-capture-status';
-
-        row.appendChild(lbl);
-        row.appendChild(input);
-        row.appendChild(unit);
-        row.appendChild(btn);
-        row.appendChild(status);
-        wrap.appendChild(row);
+        wrap.appendChild(status);
 
         const hint = document.createElement('div');
         hint.className = 'sa-hint';
         hint.textContent =
-            'How often a new batch of frames is captured and sent to the LLM. '
-          + 'Minimum 5 seconds. The new value is saved to the layout file '
-          + 'and persists across page reloads.';
+            'Batch every: how often a new batch starts (min 5 s). '
+          + 'Frames per batch: photos taken each cycle. '
+          + 'Interval: seconds between individual frames. '
+          + 'All values are saved to the layout file and picked up by the slowtask within a few seconds.';
         wrap.appendChild(hint);
 
-        this._cycleInput   = input;
-        this._cycleStatus  = status;
-        this._cycleApplyBtn = btn;
+        this._cycleInput      = cycleRow.inp;
+        this._cycleApplyBtn   = cycleRow.btn;
+        this._framesInput     = framesRow.inp;
+        this._framesApplyBtn  = framesRow.btn;
+        this._intervalInput   = intervalRow.inp;
+        this._intervalApplyBtn = intervalRow.btn;
+        this._cycleStatus     = status;
 
         left.appendChild(wrap);
     }
@@ -471,10 +509,15 @@ export class SlowAgentApp {
         // ── Capture cadence apply ─────────────────────────────────────── //
         this._cycleApplyBtn.addEventListener('click', () => this._saveCycleSeconds());
         this._cycleInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                this._saveCycleSeconds();
-            }
+            if (e.key === 'Enter') { e.preventDefault(); this._saveCycleSeconds(); }
+        });
+        this._framesApplyBtn.addEventListener('click', () => this._saveFramesPerCycle());
+        this._framesInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); this._saveFramesPerCycle(); }
+        });
+        this._intervalApplyBtn.addEventListener('click', () => this._saveFrameInterval());
+        this._intervalInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); this._saveFrameInterval(); }
         });
 
         // ── Connected-channel checkboxes (debounced auto-save) ────────── //
@@ -508,6 +551,38 @@ export class SlowAgentApp {
             await AgentAPI.updateSettings(this.configFile, { cycle_seconds: cs });
             if (this.config?.capture) this.config.capture.cycle_seconds = cs;
             this._setCycleStatus(`Saved — slowtask will pick up ${cs}s shortly.`);
+        } catch (e) {
+            this._setCycleStatus(`Error: ${e.message}`, true);
+        }
+    }
+
+    async _saveFramesPerCycle() {
+        const n = parseInt(this._framesInput.value, 10);
+        if (!isFinite(n) || n < 1 || n > 60) {
+            this._setCycleStatus('Frames per batch must be between 1 and 60.', true);
+            return;
+        }
+        this._setCycleStatus('Saving…');
+        try {
+            await AgentAPI.updateSettings(this.configFile, { frames_per_cycle: n });
+            if (this.config?.capture) this.config.capture.frames_per_cycle = n;
+            this._setCycleStatus(`Saved — ${n} frames per batch.`);
+        } catch (e) {
+            this._setCycleStatus(`Error: ${e.message}`, true);
+        }
+    }
+
+    async _saveFrameInterval() {
+        const s = parseFloat(this._intervalInput.value);
+        if (!isFinite(s) || s < 0.1 || s > 60) {
+            this._setCycleStatus('Frame interval must be between 0.1 and 60 seconds.', true);
+            return;
+        }
+        this._setCycleStatus('Saving…');
+        try {
+            await AgentAPI.updateSettings(this.configFile, { frame_interval: s });
+            if (this.config?.capture) this.config.capture.frame_interval = s;
+            this._setCycleStatus(`Saved — ${s}s between frames.`);
         } catch (e) {
             this._setCycleStatus(`Error: ${e.message}`, true);
         }
